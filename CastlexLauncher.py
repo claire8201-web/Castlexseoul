@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-LAUNCHER_VERSION = "1.0.0"
+LAUNCHER_VERSION = "1.0.1"
 APP_EXE_NAME = "CastlexSeoul.exe"
 LOCAL_VERSION_FILE = "app_version.json"
 CONFIG_FILE = "launcher_config.json"
@@ -41,6 +41,12 @@ def local_app_path() -> str:
 
 def local_version_path() -> str:
     return os.path.join(base_dir(), LOCAL_VERSION_FILE)
+
+
+def temp_download_dir() -> str:
+    path = os.path.join(base_dir(), "_update_tmp")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def load_config() -> dict:
@@ -166,7 +172,11 @@ def download_release_binary(url: str, expected_sha256: str) -> str:
         if actual.lower() != expected_sha256.lower():
             raise RuntimeError("다운로드한 파일의 SHA256 검증에 실패했습니다.")
 
-    fd, temp_path = tempfile.mkstemp(prefix="castlex_update_", suffix=".exe")
+    fd, temp_path = tempfile.mkstemp(
+        prefix="castlex_update_",
+        suffix=".exe",
+        dir=temp_download_dir(),
+    )
     os.close(fd)
     with open(temp_path, "wb") as f:
         f.write(data)

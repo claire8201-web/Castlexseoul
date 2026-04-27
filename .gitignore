@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+screenshots/
+
+credentials.enc.json
+user_config.json
+user_config_backup.json
+
+*.bak

@@ -78,7 +78,7 @@ APP_TITLE = "캐슬렉스 서울 예약"
 APP_LOGO_PNG = "castlexseoul_v8.png"
 APP_ICON_ICO = "castlexseoul_v8.ico"
 APP_USER_MODEL_ID = "castlexseoul.castlexseoul_v810"
-APP_VERSION = "8.1.1"
+APP_VERSION = "8.1.2"
 MAX_SAVED_ACCOUNTS = 20
 DPAPI_ENTROPY = b"CastlexSeoul_V8.1.0_Credentials"
 
@@ -801,7 +801,12 @@ class App:
 
             en = tk.BooleanVar(value=prio_cfg.get(str(i+1), {}).get("enabled", True))
             self.prio_enabled.append(en)
-            ttk.Checkbutton(rowf, text=f"{i+1}순위 사용", variable=en).pack(side="left")
+            ttk.Checkbutton(
+                rowf,
+                text=f"{i+1}순위 사용",
+                variable=en,
+                command=lambda idx=i: self._on_prio_enabled_change(idx),
+            ).pack(side="left")
 
             dflt_date = prio_cfg.get(str(i+1), {}).get("date")
             de = DateEntry(rowf, width=10, date_pattern="yyyy-mm-dd", showweeknumbers=False)
@@ -815,9 +820,13 @@ class App:
 
             dflt_time = prio_cfg.get(str(i+1), {}).get("time", "08:30")
             cb = ttk.Combobox(rowf, values=time_opts, state="readonly", width=7)
-            cb.set(dflt_time if dflt_time in time_opts else "08:30")
+            cb.set(dflt_time if dflt_time in time_opts else "")
             cb.pack(side="left", padx=6)
             self.prio_time.append(cb)
+
+            if not en.get():
+                self._clear_prio_inputs(i)
+            self._apply_prio_enabled_state(i)
 
         # 버튼
         btn_row = tk.Frame(left)
@@ -890,6 +899,30 @@ class App:
 
     def _toggle_pw(self):
         self.pw_entry.configure(show="" if self.show_pw.get() else "*")
+
+    def _get_prio_date_text(self, index: int) -> str:
+        return self.prio_date[index].get().strip()
+
+    def _clear_prio_inputs(self, index: int):
+        self.prio_date[index].delete(0, "end")
+        self.prio_time[index].set("")
+
+    def _apply_prio_enabled_state(self, index: int):
+        enabled = bool(self.prio_enabled[index].get())
+        state = "readonly" if enabled else "disabled"
+        try:
+            self.prio_date[index].configure(state=state)
+        except Exception:
+            pass
+        try:
+            self.prio_time[index].configure(state=state)
+        except Exception:
+            pass
+
+    def _on_prio_enabled_change(self, index: int):
+        if not self.prio_enabled[index].get():
+            self._clear_prio_inputs(index)
+        self._apply_prio_enabled_state(index)
 
     def _show_cred_warn_once(self, msg: str):
         if self._cred_error_shown:
@@ -1038,10 +1071,11 @@ class App:
     def _save_ui_config(self):
         prio = {}
         for i in range(3):
+            enabled = bool(self.prio_enabled[i].get())
             prio[str(i+1)] = {
-                "enabled": bool(self.prio_enabled[i].get()),
-                "date": self.prio_date[i].get_date().strftime("%Y%m%d"),
-                "time": self.prio_time[i].get()
+                "enabled": enabled,
+                "date": self.prio_date[i].get().strip() if enabled else "",
+                "time": self.prio_time[i].get().strip() if enabled else ""
             }
 
         data = {
@@ -1069,8 +1103,16 @@ class App:
         priorities = []
         for i in range(3):
             if self.prio_enabled[i].get():
-                d = self.prio_date[i].get_date().strftime("%Y%m%d")
-                t = self.prio_time[i].get()
+                date_text = self._get_prio_date_text(i)
+                t = self.prio_time[i].get().strip()
+                if not date_text:
+                    raise ValueError(f"{i+1}순위 날짜를 선택하세요.")
+                if not t:
+                    raise ValueError(f"{i+1}순위 시간을 선택하세요.")
+                try:
+                    d = datetime.datetime.strptime(date_text, "%Y-%m-%d").strftime("%Y%m%d")
+                except ValueError:
+                    raise ValueError(f"{i+1}순위 날짜 형식이 올바르지 않습니다.")
                 priorities.append({"date": d, "base_time": t})
 
         if not priorities:

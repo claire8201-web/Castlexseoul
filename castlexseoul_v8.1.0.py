@@ -78,7 +78,7 @@ APP_TITLE = "캐슬렉스 서울 예약"
 APP_LOGO_PNG = "castlexseoul_v8.png"
 APP_ICON_ICO = "castlexseoul_v8.ico"
 APP_USER_MODEL_ID = "castlexseoul.castlexseoul_v810"
-APP_VERSION = "8.1.2"
+APP_VERSION = "8.1.3"
 MAX_SAVED_ACCOUNTS = 20
 DPAPI_ENTROPY = b"CastlexSeoul_V8.1.0_Credentials"
 
@@ -1217,7 +1217,8 @@ class App:
 
         finally:
             try:
-                bot.quit_driver()
+                if self.stop_event.is_set() or self.status_var.get() == "에러 발생":
+                    bot.quit_driver()
             except Exception:
                 pass
             self._set_running(False)

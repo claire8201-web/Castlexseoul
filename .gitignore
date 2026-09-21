@@ -3,6 +3,7 @@ __pycache__/
 build/
 dist/
 screenshots/
+logs/
 
 credentials.enc.json
 user_config.json

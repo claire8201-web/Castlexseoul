@@ -78,7 +78,15 @@ APP_TITLE = "캐슬렉스 서울 예약"
 APP_LOGO_PNG = "castlexseoul_v8.png"
 APP_ICON_ICO = "castlexseoul_v8.ico"
 APP_USER_MODEL_ID = "castlexseoul.castlexseoul_v810"
-APP_VERSION = "8.1.3"
+APP_VERSION = "8.1.5"
+EMPTY_TIMES_TIMEOUT_SECONDS = 90.0
+EMPTY_TIMES_RETRY_SECONDS = 2.0
+TIME_STRATEGIES = {
+    "nearest": "최근접 우선",
+    "later": "늦은 시간 우선",
+    "earlier": "빠른 시간 우선",
+    "offset": "최근접에서 N칸 뒤",
+}
 MAX_SAVED_ACCOUNTS = 20
 DPAPI_ENTROPY = b"CastlexSeoul_V8.1.0_Credentials"
 
@@ -175,11 +183,12 @@ def now_stamp() -> str:
 
 
 def build_time_options():
-    # UI 기본 시간(30분 단위): 05:00~17:00
+    # Preserve the existing endpoints while adding five-minute choices.
     options = []
     for h in range(5, 18):
-        for m in (0, 30):
-            options.append(f"{h:02d}:{m:02d}")
+        for m in range(0, 60, 5):
+            if h < 17 or m <= 30:
+                options.append(f"{h:02d}:{m:02d}")
     return options
 
 
@@ -441,9 +450,37 @@ class CastlexBot:
 
         uniq = sorted(set(times), key=lambda t: int(t))
         self.log(f"가용 시간 {len(uniq)}개 감지")
+        if uniq:
+            self.log("감지된 전체 시간: " + ", ".join(uniq))
         return uniq
 
-    def pick_times_by_windows(self, available_hhmm, base_time_hhmm):
+    def wait_for_available_times(self, date):
+        available = self.get_available_times_hhmm()
+        if available:
+            return available
+
+        started = time.monotonic()
+        deadline = started + EMPTY_TIMES_TIMEOUT_SECONDS
+        self.log(
+            f"{date}: 가용 시간 0개 → 지연 오픈 대기 "
+            f"(최대 {EMPTY_TIMES_TIMEOUT_SECONDS:.0f}초, 약 {EMPTY_TIMES_RETRY_SECONDS:.0f}초 간격 재조회)"
+        )
+        while True:
+            self._check_stop()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.log(f"{date}: 지연 오픈 대기 종료 → 가용 시간 없음, 다음 순위로")
+                return []
+            self.stop_event.wait(min(EMPTY_TIMES_RETRY_SECONDS, remaining))
+            self._check_stop()
+            # Re-select the date to fetch newly opened times from the server.
+            self.select_date_js(date)
+            available = self.get_available_times_hhmm()
+            if available:
+                self.log(f"{date}: {time.monotonic() - started:.1f}초 대기 후 가용 시간 감지")
+                return available
+
+    def pick_times_by_windows(self, available_hhmm, base_time_hhmm, strategy="nearest", offset=2):
         """
         기준시간 근처부터 확장: ±30 → ±60 → ±120 (분)
         """
@@ -468,7 +505,25 @@ class CastlexBot:
                 if t not in ordered:
                     ordered.append(t)
 
-        return ordered
+        if strategy == "nearest" or not ordered:
+            return ordered
+        if strategy == "later":
+            return ([t for t in ordered if to_min(t) >= target]
+                    + [t for t in ordered if to_min(t) < target])
+        if strategy == "earlier":
+            return ([t for t in ordered if to_min(t) <= target]
+                    + [t for t in ordered if to_min(t) > target])
+        if strategy != "offset":
+            raise ValueError("알 수 없는 시간 선택 전략입니다.")
+        if not isinstance(offset, int) or not 1 <= offset <= 10:
+            raise ValueError("회피 칸 수는 1~10 사이여야 합니다.")
+        chronological = sorted(ordered, key=to_min)
+        nearest_index = chronological.index(ordered[0])
+        # Prefer later slots, then earlier slots, then the nearest and the rest.
+        shifts = list(range(offset, 0, -1)) + list(range(-1, -offset - 1, -1)) + [0]
+        preferred = [chronological[nearest_index + shift] for shift in shifts
+                     if 0 <= nearest_index + shift < len(chronological)]
+        return preferred + [t for t in ordered if t not in preferred]
 
     # ---- 예약하기 클릭 + 판정 ----
     def click_reserve_and_judge(self):
@@ -498,7 +553,8 @@ class CastlexBot:
         return "OTHER_ALERT", txt_last
 
     # ---- 다건 예약 메인 ----
-    def run_priorities_multi(self, mode: str, priorities: list, live_safety_block_submit: bool = False):
+    def run_priorities_multi(self, mode: str, priorities: list, live_safety_block_submit: bool = False,
+                             time_strategy="nearest", time_offset=2):
         success_list = []
 
         for idx, p in enumerate(priorities, start=1):
@@ -511,23 +567,23 @@ class CastlexBot:
             self.go_reserve_page()
             self.select_date_js(date)
 
-            available = self.get_available_times_hhmm()
+            available = self.wait_for_available_times(date)
             if not available:
-                self.log("가용 시간이 없음 → 다음 순위로")
                 continue
 
-            candidates = self.pick_times_by_windows(available, base_time)
+            candidates = self.pick_times_by_windows(available, base_time, time_strategy, time_offset)
             if not candidates:
                 self.log("기준시간 주변(±30/60/120)에 후보가 없음 → 다음 순위로")
                 continue
 
-            preview = ", ".join(candidates[:15]) + (" ..." if len(candidates) > 15 else "")
-            self.log(f"시간 후보(근접순): {preview}")
+            self.log(f"시간 선택 전략: {time_strategy}, 회피 칸 수: {time_offset}")
+            self.log("시간 후보(시도순): " + ", ".join(candidates))
 
             reserved = False
 
-            for hhmm in candidates:
+            for candidate_number, hhmm in enumerate(candidates, start=1):
                 self._check_stop()
+                self.log(f"{date}: 후보 {candidate_number}/{len(candidates)} 시도: {hhmm}")
 
                 ok = self.select_time_js(date, hhmm)
                 if not ok:
@@ -626,6 +682,18 @@ class App:
 
         self.cfg = load_config()
         self.log_q = queue.Queue()
+        self.log_path = None
+        self._log_secrets = ()
+        try:
+            log_dir = os.path.join(BASE_DIR, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            self.log_path = os.path.join(log_dir, f"castlex_{now_stamp()}_{os.getpid()}.log")
+            with open(self.log_path, "a", encoding="utf-8"):
+                pass
+            self.log(f"v{APP_VERSION} 로그 파일: {self.log_path}")
+        except OSError:
+            self.log_path = None
+            self.log("로그 파일을 만들 수 없습니다. 화면 로그만 표시합니다.")
         self.stop_event = threading.Event()
         self.saved_accounts = []
         self._cred_error_shown = False
@@ -672,7 +740,10 @@ class App:
         if not icon_applied:
             self.log(f"아이콘 적용 실패: {APP_ICON_ICO} / {APP_LOGO_PNG} 파일을 찾지 못했습니다.")
     def log(self, msg: str):
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        for secret in self._log_secrets:
+            if secret:
+                msg = msg.replace(secret, "[REDACTED]")
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         self.log_q.put(f"[{ts}] {msg}")
 
     def _build_ui(self):
@@ -812,7 +883,8 @@ class App:
             de = DateEntry(rowf, width=10, date_pattern="yyyy-mm-dd", showweeknumbers=False)
             if dflt_date:
                 try:
-                    de.set_date(datetime.datetime.strptime(dflt_date, "%Y%m%d").date())
+                    date_format = "%Y-%m-%d" if "-" in dflt_date else "%Y%m%d"
+                    de.set_date(datetime.datetime.strptime(dflt_date, date_format).date())
                 except Exception:
                     pass
             de.pack(side="left", padx=6)
@@ -827,6 +899,25 @@ class App:
             if not en.get():
                 self._clear_prio_inputs(i)
             self._apply_prio_enabled_state(i)
+
+        strategy_row = ttk.Frame(left)
+        strategy_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(strategy_row, text="시간 전략").pack(side="left")
+        strategy = self.cfg.get("time_strategy", "nearest")
+        self.time_strategy_var = tk.StringVar(value=TIME_STRATEGIES.get(strategy, TIME_STRATEGIES["nearest"]))
+        self.strategy_combo = ttk.Combobox(strategy_row, values=list(TIME_STRATEGIES.values()),
+                                           textvariable=self.time_strategy_var, state="readonly", width=21)
+        self.strategy_combo.pack(side="left", padx=6)
+        self.strategy_combo.bind("<<ComboboxSelected>>", self._on_strategy_change)
+        offset = self.cfg.get("time_offset", 2)
+        if not isinstance(offset, int) or not 1 <= offset <= 10:
+            offset = 2
+        self.time_offset_var = tk.StringVar(value=str(offset))
+        self.offset_spin = ttk.Spinbox(strategy_row, from_=1, to=10, width=3,
+                                      textvariable=self.time_offset_var)
+        self.offset_spin.pack(side="left")
+        ttk.Label(strategy_row, text="칸").pack(side="left", padx=3)
+        self._on_strategy_change()
 
         # 버튼
         btn_row = tk.Frame(left)
@@ -863,6 +954,10 @@ class App:
              fg="gray"
         )
         footer.pack(side="bottom", anchor="w", padx=10, pady=5)
+
+    def _on_strategy_change(self, _event=None):
+        self.offset_spin.configure(state="readonly" if self.time_strategy_var.get() == TIME_STRATEGIES["offset"]
+                                   else "disabled")
 
     def _on_mode_change(self):
         # 테스트 모드에서는 실예약 옵션을 비활성화
@@ -1053,15 +1148,24 @@ class App:
             self._show_cred_warn_once("저장 계정 삭제에 실패했습니다.")
 
     def _tick_log(self):
+        lines = []
         try:
-            while True:
-                msg = self.log_q.get_nowait()
-                self.log_text.configure(state="normal")
-                self.log_text.insert("end", msg + "\n")
-                self.log_text.see("end")
-                self.log_text.configure(state="disabled")
+            for _ in range(200):
+                lines.append(self.log_q.get_nowait())
         except queue.Empty:
             pass
+        if lines:
+            if self.log_path:
+                try:
+                    with open(self.log_path, "a", encoding="utf-8") as stream:
+                        stream.write("\n".join(lines) + "\n")
+                except OSError:
+                    self.log_path = None
+                    lines.append("로그 파일 저장 실패: 화면 로그만 표시합니다.")
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", "\n".join(lines) + "\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
         self.root.after(120, self._tick_log)
 
     def _set_running(self, running: bool):
@@ -1084,9 +1188,14 @@ class App:
             "mode": self.mode_var.get(),
             "wait_server": bool(self.wait_server_var.get()),
             "live_safety_block_submit": bool(self.live_safe_var.get()),
+            "time_strategy": self._selected_time_strategy(),
+            "time_offset": int(self.time_offset_var.get()),
             "prio": prio
         }
         save_config(data)
+
+    def _selected_time_strategy(self):
+        return next(key for key, label in TIME_STRATEGIES.items() if label == self.time_strategy_var.get())
 
     def _build_run_config(self):
         user_id = self.id_var.get().strip()
@@ -1118,12 +1227,18 @@ class App:
         if not priorities:
             raise ValueError("최소 1개 이상 우선순위를 '사용'으로 체크하세요.")
 
+        offset = int(self.time_offset_var.get())
+        if not 1 <= offset <= 10:
+            raise ValueError("회피 칸 수는 1~10 사이여야 합니다.")
+
         return {
             "id": user_id,
             "pw": user_pw,
             "mode": self.mode_var.get(),
             "wait_server": bool(self.wait_server_var.get()),
             "live_safety_block_submit": bool(self.live_safe_var.get()),
+            "time_strategy": self._selected_time_strategy(),
+            "time_offset": offset,
             "priorities": priorities
         }
 
@@ -1147,9 +1262,10 @@ class App:
         self.stop_event.set()
         self.log("중단 요청")
         self.status_var.set("중단 요청됨... 브라우저 종료 중")
-        self._set_running(False)
+        self.btn_stop.configure(state="disabled")
 
     def _worker_main(self, cfg):
+        self._log_secrets = (cfg.get("pw", ""), cfg.get("id", ""))
         bot = CastlexBot(self.stop_event, self.log)
         result = None
         success_list = []
@@ -1182,7 +1298,9 @@ class App:
             result, success_list = bot.run_priorities_multi(
                 cfg["mode"],
                 cfg["priorities"],
-                live_safety_block_submit=bool(cfg.get("live_safety_block_submit", False))
+                live_safety_block_submit=bool(cfg.get("live_safety_block_submit", False)),
+                time_strategy=cfg.get("time_strategy", "nearest"),
+                time_offset=cfg.get("time_offset", 2)
             )
             if str(result).startswith("TEST_MULTI_OK"):
                 self.status_var.set(f"테스트 완료 {len(success_list)}건(예약 직전까지)")
@@ -1207,13 +1325,17 @@ class App:
             self.log(f"===== 작업 종료: {result} =====")
 
         except Exception as e:
-            self.status_var.set("에러 발생")
-            self.log(f"❌ 에러: {e}")
-            try:
-                bot._screenshot("exception")
-            except Exception:
-                pass
-            messagebox.showerror("에러", str(e))
+            if self.stop_event.is_set():
+                self.status_var.set("중단됨")
+                self.log("사용자 요청으로 작업을 중단했습니다.")
+            else:
+                self.status_var.set("에러 발생")
+                self.log(f"❌ 에러: {e}")
+                try:
+                    bot._screenshot("exception")
+                except Exception:
+                    pass
+                messagebox.showerror("에러", str(e))
 
         finally:
             try:

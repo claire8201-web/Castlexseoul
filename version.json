@@ -1,6 +1,6 @@
 {
-  "version": "8.1.3",
+  "version": "8.1.5",
   "asset_name": "CastlexSeoul.exe",
-  "notes": "작업 완료 후 실행된 크롬창을 자동으로 닫지 않도록 변경",
-  "sha256": "dafddf6532c124f8a02704bb627b5fcdeb6b9f1efb724f94163390c3e8a3a04b"
+  "notes": "지연 오픈 90초 재조회, 시간 선택 전략 및 N칸 회피, 5분 단위 기준시간, 실행 로그 저장, 날짜 복원 및 중단 처리 개선",
+  "sha256": "7af38efa4af11aa355ead638c15ce3710cc8d3b68561dd8fdbdce9d7531dbf02"
 }

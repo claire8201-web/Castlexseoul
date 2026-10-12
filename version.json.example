@@ -1,6 +1,6 @@
 {
-  "version": "8.1.6",
+  "version": "8.1.7",
   "asset_name": "CastlexSeoul.exe",
-  "notes": "IN/OUT 원본 예약 링크 적용, 본인 중복예약 즉시 건너뛰기, 실패 후 최신 목록 갱신, 불필요한 대기 감소, 결과 미확인 시 중단",
-  "sha256": "b23dc1bbb1b26d6633e574364bdd66e62a98ddcf21015beecf23bac9337eac7c"
+  "notes": "날짜 선택 시간 초과 수정: 실제 페이지 이동 및 7개 예약 인자 지원, 안내 팝업 처리, 가용시간 0개 시 사이트 안내 기록",
+  "sha256": "c3a1d3ce83dbc215eac45494ffff53b10eb2cb524e810766217470ea7dd90e27"
 }

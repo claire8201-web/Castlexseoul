@@ -29,10 +29,11 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
 from reservation_logic import parse_booking_link, classify_booking_message
 
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit, parse_qs
 from email.utils import parsedate_to_datetime
 
 # 로고 안정 로딩(선택)
@@ -80,7 +81,7 @@ APP_TITLE = "캐슬렉스 서울 예약"
 APP_LOGO_PNG = "castlexseoul_v8.png"
 APP_ICON_ICO = "castlexseoul_v8.ico"
 APP_USER_MODEL_ID = "castlexseoul.castlexseoul_v810"
-APP_VERSION = "8.1.6"
+APP_VERSION = "8.1.7"
 EMPTY_TIMES_TIMEOUT_SECONDS = 90.0
 EMPTY_TIMES_RETRY_SECONDS = 2.0
 TIME_STRATEGIES = {
@@ -425,6 +426,7 @@ class CastlexBot:
             raise RuntimeError("로그인 화면으로 이동했습니다. 작업을 중단합니다.")
 
     def _watch_panel(self, panel_id):
+        self._watched_panel = panel_id
         self.driver.execute_script("""
             if (window.__castlexObserver) window.__castlexObserver.disconnect();
             const id = arguments[0];
@@ -442,31 +444,57 @@ class CastlexBot:
 
     def _panel_changed(self, driver):
         self._ensure_session()
-        return driver.execute_script("""
-            return window.__castlexChanged === true &&
-                !(window.jQuery && window.jQuery.active > 0);
-        """)
+        state = driver.execute_script("""
+            const selector = arguments[0] === 'confirm' ? '#confirm, button.btn_reOK' : '#time';
+            return {changed: window.__castlexChanged === true,
+                navigated: typeof window.__castlexChanged === 'undefined',
+                ready: document.readyState === 'complete', panel: !!document.querySelector(selector),
+                busy: !!(window.jQuery && window.jQuery.active > 0)};
+        """, self._watched_panel)
+        if not state['ready'] or not state['panel']:
+            return False
+        if state['navigated']:
+            params = parse_qs(urlsplit(driver.current_url).query, keep_blank_values=True)
+            return all(params.get(key) == [value] for key, value in self._expected_params.items())
+        return state['changed'] and not state['busy']
 
     # ---- 예약 동작 ----
+    def _selection_ready(self, driver):
+        try:
+            return self._panel_changed(driver)
+        except UnexpectedAlertPresentException as exc:
+            text = exc.alert_text or "날짜 선택 안내"
+            self.log(f"[화면 안내] {text}")
+            self._drain_one_alert_text(timeout=0.1)
+            if classify_booking_message(text) == "SESSION_EXPIRED":
+                raise RuntimeError("날짜 조회 중 로그인이 만료되었습니다.") from exc
+            return False
+
     def select_date_js(self, yyyymmdd: str):
         self._check_stop()
         self.log(f"날짜 선택: {yyyymmdd} (Date_Click)")
         self._ensure_session()
+        self._expected_params = {"book_date": yyyymmdd, "proc_div": "B"}
         self._watch_panel("time")
         self.driver.execute_script("Date_Click('B', arguments[0]);", yyyymmdd)
-        WebDriverWait(self.driver, 10, poll_frequency=0.1).until(self._panel_changed)
+        try:
+            WebDriverWait(self.driver, 10, poll_frequency=0.1).until(self._selection_ready)
+        except TimeoutException as exc:
+            raise RuntimeError(f"날짜 {yyyymmdd} 예약 화면 로딩 시간 초과: 날짜 URL/시간 영역을 확인할 수 없습니다.") from exc
 
     def select_time_js(self, slot):
         self._check_stop()
         self._ensure_session()
         self.log(f"시간 선택 시도: {slot[0]} {slot[3]} {slot[4]} (Book_Confirm)")
+        self._expected_params = {"book_date": slot[0], "book_crs": slot[2],
+                                 "book_crs_name": slot[3], "book_time": slot[4]}
         self._watch_panel("confirm")
         self.driver.execute_script("Book_Confirm.apply(null, arguments[0]);", list(slot))
 
         # confirm 영역이 뜨는지로 판정(좀 더 안정적으로 대기)
         try:
             WebDriverWait(self.driver, 6, poll_frequency=0.1).until(
-                lambda d: self._panel_changed(d) and
+                lambda d: self._selection_ready(d) and
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn_reOK"))(d))
             return True
         except TimeoutException:
@@ -477,10 +505,11 @@ class CastlexBot:
     def get_available_slots(self, date):
         self._check_stop()
         self._ensure_session()
-        hrefs = self.driver.execute_script("""
-            return Array.from(document.querySelectorAll("#time a[href*='Book_Confirm']"),
-                a => a.getAttribute('href'));
+        snapshot = self.driver.execute_script("""
+            return {hrefs: Array.from(document.querySelectorAll("#time a[href*='Book_Confirm']"),
+                a => a.getAttribute('href')), notice: document.querySelector('#time')?.innerText || ''};
         """)
+        hrefs = snapshot['hrefs']
         slots = []
         for href in hrefs:
             try:
@@ -493,6 +522,11 @@ class CastlexBot:
         self.log(f"가용 티타임 {len(slots)}개 감지(IN/OUT 별도)")
         if slots:
             self.log("감지된 전체 티타임: " + ", ".join(f"{s[3]} {s[4]}" for s in slots))
+        else:
+            notice = " ".join(snapshot['notice'].split())[:500]
+            if notice and notice != getattr(self, '_last_time_notice', None):
+                self.log(f"사이트 시간 안내: {notice}")
+                self._last_time_notice = notice
         return slots
 
     def wait_for_available_times(self, date):
@@ -1388,7 +1422,7 @@ class App:
                 self.log("사용자 요청으로 작업을 중단했습니다.")
             else:
                 self.status_var.set("에러 발생")
-                self.log(f"❌ 에러: {e}")
+                self.log(f"❌ 에러: {type(e).__name__}: {str(e).strip() or '상세 메시지 없음'}")
                 try:
                     bot._screenshot("exception")
                 except Exception:

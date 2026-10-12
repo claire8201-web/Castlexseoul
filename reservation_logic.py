@@ -12,7 +12,7 @@ def parse_booking_link(href, date):
         args = ast.literal_eval("(" + match.group(1) + ",)")
     except (SyntaxError, ValueError) as exc:
         raise ValueError("Non-literal reservation arguments") from exc
-    if len(args) != 6 or not all(isinstance(arg, str) for arg in args):
+    if len(args) not in (6, 7) or not all(isinstance(arg, str) for arg in args):
         raise ValueError("Unexpected reservation arguments")
     if args[0] != date:
         raise ValueError("Reservation date does not match selected date")

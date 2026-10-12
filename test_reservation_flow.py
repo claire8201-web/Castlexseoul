@@ -81,6 +81,11 @@ class ReservationFlowTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 parse_booking_link(href, "20261010")
 
+    def test_live_seven_argument_link(self):
+        href = "JavaScript:Book_Confirm('20261020','화','2', 'IN','0610','','');"
+        self.assertEqual(parse_booking_link(href, "20261020"),
+                         ("20261020", "화", "2", "IN", "0610", "", ""))
+
     def test_actual_log_messages_classified(self):
         messages = {
             "[당일 중복예약 제한]\n 고객님께서 이미 예약을 하셨기 때문에 추가 예약을 하실수 없습니다.": "ALREADY_RESERVED",

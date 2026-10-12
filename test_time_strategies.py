@@ -45,12 +45,12 @@ class TimeStrategyTests(unittest.TestCase):
     def test_strategy_is_used_by_booking_flow(self):
         from unittest.mock import Mock
         self.bot.go_reserve_page = Mock()
-        self.bot.wait_for_available_times = Mock(return_value=self.times)
+        self.bot.wait_for_available_times = Mock(return_value=[test_delayed_open.slot(hhmm=t) for t in self.times])
         self.bot.select_time_js = Mock(return_value=True)
         self.bot.click_reserve_and_judge = Mock()
         self.bot.run_priorities_multi("test", [{"date": "20261010", "base_time": "12:00"}],
                                       time_strategy="offset", time_offset=2)
-        self.bot.select_time_js.assert_called_once_with("20261010", "1214")
+        self.bot.select_time_js.assert_called_once_with(test_delayed_open.slot(hhmm="1214"))
         self.bot.click_reserve_and_judge.assert_not_called()
 
 

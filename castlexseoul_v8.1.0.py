@@ -1,4 +1,4 @@
-﻿# golf_reserver.py  (v7 배포용: v6 + 로그인 검증 + EXE(frozen) 경로/리소스 처리 + 드라이버 안정화)
+# golf_reserver.py  (v7 배포용: v6 + 로그인 검증 + EXE(frozen) 경로/리소스 처리 + 드라이버 안정화)
 #
 # 필수 설치(개발PC):
 #   pip install selenium tkcalendar
@@ -29,6 +29,8 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from reservation_logic import parse_booking_link, classify_booking_message
 
 from urllib.request import Request, urlopen
 from email.utils import parsedate_to_datetime
@@ -78,7 +80,7 @@ APP_TITLE = "캐슬렉스 서울 예약"
 APP_LOGO_PNG = "castlexseoul_v8.png"
 APP_ICON_ICO = "castlexseoul_v8.ico"
 APP_USER_MODEL_ID = "castlexseoul.castlexseoul_v810"
-APP_VERSION = "8.1.5"
+APP_VERSION = "8.1.6"
 EMPTY_TIMES_TIMEOUT_SECONDS = 90.0
 EMPTY_TIMES_RETRY_SECONDS = 2.0
 TIME_STRATEGIES = {
@@ -270,6 +272,7 @@ class CastlexBot:
         self.log = log_func
         self.driver = None
         self.wait = None
+        self._reserve_ready = False
 
     def _check_stop(self):
         if self.stop_event.is_set():
@@ -409,53 +412,91 @@ class CastlexBot:
         self._check_stop()
         self.log("온라인예약 페이지 이동")
         self.driver.get(RESERVE_URL)
-        time.sleep(0.8)
-        self._drain_all_dialogs(max_loops=3)
+        self._ensure_session()
+        WebDriverWait(self.driver, 10, poll_frequency=0.1).until(
+            lambda d: d.execute_script("return typeof Date_Click === 'function'"))
+        self._reserve_ready = True
+
+    def _ensure_session(self):
+        self._check_stop()
+        if "login.asp" in (self.driver.current_url or "").lower():
+            raise RuntimeError("로그인 세션이 만료되었습니다. 다시 로그인해 주세요.")
+        if self.driver.find_elements(By.ID, "user_pw"):
+            raise RuntimeError("로그인 화면으로 이동했습니다. 작업을 중단합니다.")
+
+    def _watch_panel(self, panel_id):
+        self.driver.execute_script("""
+            if (window.__castlexObserver) window.__castlexObserver.disconnect();
+            const id = arguments[0];
+            window.__castlexChanged = false;
+            window.__castlexObserver = new MutationObserver(records => {
+                if (records.some(r => {
+                    const el = r.target.nodeType === 1 ? r.target : r.target.parentElement;
+                    return (el && (el.id === id || el.closest('#' + id))) ||
+                        [...r.addedNodes, ...r.removedNodes].some(n =>
+                            n.nodeType === 1 && (n.id === id || n.querySelector('#' + id)));
+                })) window.__castlexChanged = true;
+            });
+            window.__castlexObserver.observe(document.body, {childList:true, subtree:true, attributes:true, characterData:true});
+        """, panel_id)
+
+    def _panel_changed(self, driver):
+        self._ensure_session()
+        return driver.execute_script("""
+            return window.__castlexChanged === true &&
+                !(window.jQuery && window.jQuery.active > 0);
+        """)
 
     # ---- 예약 동작 ----
     def select_date_js(self, yyyymmdd: str):
         self._check_stop()
         self.log(f"날짜 선택: {yyyymmdd} (Date_Click)")
-        self.driver.execute_script(f"Date_Click('B','{yyyymmdd}');")
-        time.sleep(0.55)
-        self._drain_all_dialogs(max_loops=3)
+        self._ensure_session()
+        self._watch_panel("time")
+        self.driver.execute_script("Date_Click('B', arguments[0]);", yyyymmdd)
+        WebDriverWait(self.driver, 10, poll_frequency=0.1).until(self._panel_changed)
 
-    def select_time_js(self, yyyymmdd: str, hhmm: str):
+    def select_time_js(self, slot):
         self._check_stop()
-        self.log(f"시간 선택 시도: {hhmm} (Book_Confirm)")
-        self.driver.execute_script(f"Book_Confirm('{yyyymmdd}','B','1','OUT','{hhmm}','');")
+        self._ensure_session()
+        self.log(f"시간 선택 시도: {slot[0]} {slot[3]} {slot[4]} (Book_Confirm)")
+        self._watch_panel("confirm")
+        self.driver.execute_script("Book_Confirm.apply(null, arguments[0]);", list(slot))
 
         # confirm 영역이 뜨는지로 판정(좀 더 안정적으로 대기)
         try:
-            WebDriverWait(self.driver, 6).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "#confirm, button.btn_reOK"))
-            )
-            self._drain_all_dialogs(max_loops=3)
+            WebDriverWait(self.driver, 6, poll_frequency=0.1).until(
+                lambda d: self._panel_changed(d) and
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn_reOK"))(d))
             return True
-        except Exception:
-            self._drain_all_dialogs(max_loops=3)
+        except TimeoutException:
+            self.log("예약 확인 화면 갱신을 확인하지 못함 → 목록 재조회")
             return False
 
     # ---- 7분 단위 시간 리스트 읽기 ----
-    def get_available_times_hhmm(self):
+    def get_available_slots(self, date):
         self._check_stop()
-        times = []
-        anchors = self.driver.find_elements(By.CSS_SELECTOR, "#time a[href*='Book_Confirm']")
-        for a in anchors:
-            href = a.get_attribute("href") or ""
-            found = re.findall(r"\'(\d{4})\'", href)
-            for x in found:
-                if x.isdigit() and len(x) == 4:
-                    times.append(x)
-
-        uniq = sorted(set(times), key=lambda t: int(t))
-        self.log(f"가용 시간 {len(uniq)}개 감지")
-        if uniq:
-            self.log("감지된 전체 시간: " + ", ".join(uniq))
-        return uniq
+        self._ensure_session()
+        hrefs = self.driver.execute_script("""
+            return Array.from(document.querySelectorAll("#time a[href*='Book_Confirm']"),
+                a => a.getAttribute('href'));
+        """)
+        slots = []
+        for href in hrefs:
+            try:
+                slot = parse_booking_link(href, date)
+            except ValueError as exc:
+                raise RuntimeError(f"예약 링크 형식/날짜 불일치: {exc}. 추측 예약을 중단합니다.") from exc
+            if slot not in slots:
+                slots.append(slot)
+        slots.sort(key=lambda slot: slot[4])
+        self.log(f"가용 티타임 {len(slots)}개 감지(IN/OUT 별도)")
+        if slots:
+            self.log("감지된 전체 티타임: " + ", ".join(f"{s[3]} {s[4]}" for s in slots))
+        return slots
 
     def wait_for_available_times(self, date):
-        available = self.get_available_times_hhmm()
+        available = self.get_available_slots(date)
         if available:
             return available
 
@@ -475,7 +516,7 @@ class CastlexBot:
             self._check_stop()
             # Re-select the date to fetch newly opened times from the server.
             self.select_date_js(date)
-            available = self.get_available_times_hhmm()
+            available = self.get_available_slots(date)
             if available:
                 self.log(f"{date}: {time.monotonic() - started:.1f}초 대기 후 가용 시간 감지")
                 return available
@@ -528,68 +569,80 @@ class CastlexBot:
     # ---- 예약하기 클릭 + 판정 ----
     def click_reserve_and_judge(self):
         self._check_stop()
+        self._ensure_session()
         self.log("예약하기 버튼 클릭")
         btn = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn_reOK")))
         btn.click()
 
-        txt_last = None
         for _ in range(10):
-            txt = self._drain_one_alert_text(timeout=0.9)
-            if not txt:
-                break
-            txt_last = txt
+            self._check_stop()
+            try:
+                alert = WebDriverWait(self.driver, 6, poll_frequency=0.1).until(EC.alert_is_present())
+            except TimeoutException:
+                return "UNKNOWN_RESULT", "예약 결과 응답 없음: 예약 내역을 확인해 주세요."
+            txt = alert.text
             self.log(f"[팝업] {txt}")
-
-        if not txt_last:
-            return "NO_ALERT", None
-
-        if ("점검" in txt_last) or ("정비" in txt_last):
-            return "MAINTENANCE", txt_last
-        if ("이미" in txt_last) or ("불가" in txt_last) or ("다른예약" in txt_last) or ("불가능" in txt_last):
-            return "DUPLICATE_OR_FAIL", txt_last
-        if ("완료" in txt_last) or ("성공" in txt_last):
-            return "SUCCESS_TEXT", txt_last
-
-        return "OTHER_ALERT", txt_last
+            status = classify_booking_message(txt)
+            if status == "UNKNOWN_RESULT":
+                alert.dismiss()
+            else:
+                alert.accept()
+            if status != "CONFIRM":
+                return status, txt
+        return "UNKNOWN_RESULT", "예약 확인 팝업이 반복되어 중단했습니다."
 
     # ---- 다건 예약 메인 ----
     def run_priorities_multi(self, mode: str, priorities: list, live_safety_block_submit: bool = False,
                              time_strategy="nearest", time_offset=2):
         success_list = []
+        completed_dates = set()
+        already_reserved_dates = set()
 
         for idx, p in enumerate(priorities, start=1):
             self._check_stop()
             date = p["date"]
             base_time = p["base_time"]
+            if date in completed_dates:
+                self.log(f"{date}: 이미 예약된 날짜 → 다음 순위로")
+                continue
 
             self.log(f"==== {idx}순위 시작: {date} / 기준 {base_time} ====")
 
-            self.go_reserve_page()
+            if not self._reserve_ready:
+                self.go_reserve_page()
             self.select_date_js(date)
 
             available = self.wait_for_available_times(date)
             if not available:
                 continue
 
-            candidates = self.pick_times_by_windows(available, base_time, time_strategy, time_offset)
-            if not candidates:
-                self.log("기준시간 주변(±30/60/120)에 후보가 없음 → 다음 순위로")
-                continue
-
             self.log(f"시간 선택 전략: {time_strategy}, 회피 칸 수: {time_offset}")
-            self.log("시간 후보(시도순): " + ", ".join(candidates))
-
             reserved = False
+            attempted = set()
+            attempt_deadline = time.monotonic() + 90
 
-            for candidate_number, hhmm in enumerate(candidates, start=1):
+            while available and time.monotonic() < attempt_deadline:
                 self._check_stop()
-                self.log(f"{date}: 후보 {candidate_number}/{len(candidates)} 시도: {hhmm}")
+                times = sorted({slot[4] for slot in available})
+                ordered_times = self.pick_times_by_windows(times, base_time, time_strategy, time_offset)
+                candidates = [slot for hhmm in ordered_times for slot in available
+                              if slot[4] == hhmm and slot not in attempted]
+                if not candidates:
+                    self.log("최신 목록에 미시도 후보 없음(±120분 범위) → 다음 순위로")
+                    break
+                self.log("최신 후보(시도순): " + ", ".join(f"{s[3]} {s[4]}" for s in candidates))
+                slot = candidates[0]
+                hhmm = slot[4]
+                attempted.add(slot)
+                self.log(f"{date}: {len(attempted)}번째 시도: {slot[3]} {hhmm}")
 
-                ok = self.select_time_js(date, hhmm)
+                ok = self.select_time_js(slot)
                 if not ok:
+                    self.select_date_js(date)
+                    available = self.get_available_slots(date)
                     continue
 
-                self.log(f"✅ 시간 선택 성공: {date} {hhmm}")
+                self.log(f"예약 확인 화면 진입: {date} {slot[3]} {hhmm} (예약 확정 전)")
 
                 # ✅ 테스트 모드 또는 실예약 안전 점검 모드: 클릭하지 않고 다음 순위로 진행
                 if mode == "test" or live_safety_block_submit:
@@ -603,8 +656,6 @@ class CastlexBot:
                     success_list.append((date, hhmm, tag))
                     reserved = True
 
-                    # 다음 순위 시작 전에 화면을 초기화(안정성)
-                    self.go_reserve_page()
                     break
 
                 # ✅ 실제 예약 모드
@@ -612,34 +663,33 @@ class CastlexBot:
 
                 if status == "SUCCESS_TEXT":
                     self.log("✅ 예약 성공(팝업 텍스트 기반)")
-                    success_list.append((date, hhmm, txt or "SUCCESS"))
+                    success_list.append((date, hhmm, f"{slot[3]}: {txt}"))
                     reserved = True
+                    completed_dates.add(date)
+                    self._reserve_ready = False
                     break
 
-                if status == "NO_ALERT":
-                    self.log("✅ 예약 성공(추정): 팝업 없음")
-                    success_list.append((date, hhmm, "SUCCESS(no alert)"))
-                    reserved = True
+                if status == "ALREADY_RESERVED":
+                    self.log(f"{date}: 본인 예약이 이미 있음 → 이 날짜 추가 시도 중단 (자동예약 성공으로 집계하지 않음)")
+                    completed_dates.add(date)
+                    already_reserved_dates.add(date)
                     break
 
                 if status == "MAINTENANCE":
                     self.log("⚠️ 점검/정비 팝업 감지 → 전체 중단 권장")
                     return "MAINTENANCE", success_list
                 
-                # ✅ 성공 팝업 문구는 '성공'으로 처리해야 함
-                if txt and ("정상적으로 처리" in txt and "예약" in txt):
-                    success_list.append((date, hhmm, "SUCCESS(alert)"))
-                    reserved = True
-                    self.log(f"✅ 예약 성공(팝업): {date} {hhmm}")
-                    break
+                if status in ("UNKNOWN_RESULT", "SESSION_EXPIRED"):
+                    self.log(f"{status}: {txt} → 추가 제출 중단, 예약 내역 확인 필요")
+                    return status, success_list
 
-                self.log(f"❌ 예약 실패/불가로 판단 → 다음 후보로 (msg={txt})")
-                self.go_reserve_page()
+                self.log(f"예약 선점/불가 → 같은 날짜 최신 목록 재조회 (msg={txt})")
                 self.select_date_js(date)
+                available = self.get_available_slots(date)
 
             if reserved:
                 self.log(f"==== {idx}순위 처리 완료 → 다음 순위 진행 ====")
-            else:
+            elif date not in already_reserved_dates:
                 self.log(f"==== {idx}순위 실패(근접 후보 소진) → 다음 순위 ====")
 
         # ✅ 테스트 모드 결과
@@ -666,6 +716,8 @@ class CastlexBot:
                 self.log(f"- {d} {t} : {s}")
             return f"REAL_MULTI_SUCCESS({len(success_list)})", success_list
 
+        if already_reserved_dates:
+            return f"EXISTING_RESERVATIONS({len(already_reserved_dates)})", success_list
         return "ALL_FAILED", success_list
 
 
@@ -1319,6 +1371,12 @@ class App:
                 self.status_var.set("점검 팝업 감지(중단)")
             elif result == "ALL_FAILED":
                 self.status_var.set("실패: 모든 우선순위 실패")
+            elif str(result).startswith("EXISTING_RESERVATIONS"):
+                self.status_var.set("기존 본인 예약 감지: 예약 내역 확인")
+            elif result == "UNKNOWN_RESULT":
+                self.status_var.set("예약 결과 미확인: 예약 내역 직접 확인 필요")
+            elif result == "SESSION_EXPIRED":
+                self.status_var.set("로그인 만료: 작업 중단")
             else:
                 self.status_var.set(f"종료: {result}")
 
@@ -1367,4 +1425,3 @@ if __name__ == "__main__":
     app = App(root)
     app._apply_window_icon()
     root.mainloop()
-

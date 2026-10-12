@@ -1,6 +1,6 @@
 {
-  "version": "8.1.5",
+  "version": "8.1.6",
   "asset_name": "CastlexSeoul.exe",
-  "notes": "지연 오픈 90초 재조회, 시간 선택 전략 및 N칸 회피, 5분 단위 기준시간, 실행 로그 저장, 날짜 복원 및 중단 처리 개선",
-  "sha256": "7af38efa4af11aa355ead638c15ce3710cc8d3b68561dd8fdbdce9d7531dbf02"
+  "notes": "IN/OUT 원본 예약 링크 적용, 본인 중복예약 즉시 건너뛰기, 실패 후 최신 목록 갱신, 불필요한 대기 감소, 결과 미확인 시 중단",
+  "sha256": "b23dc1bbb1b26d6633e574364bdd66e62a98ddcf21015beecf23bac9337eac7c"
 }
